@@ -8,7 +8,7 @@ library(FinancialMath)
 library(styler)
 #############################################################################
 # Stage 1 - Select technologies and order
-# Technologies are "led", ("solar" or "solarandbattery"), ("ashp" or "chp"), "gridbattery", ""
+# Technologies are "led", ("solar" or "solarandbattery"), ("ashp" or "chp"), "batteryresidual", "batteryunconstrained", ""
 technology1 <- "led"
 technology2 <- "solar"
 technology3 <- "chp"
@@ -53,6 +53,9 @@ site_opt4 <- site_opt4[order(site_opt4$Date, decreasing = FALSE), ]
 
 ##############################################################################
 # Stage 3 - Define and classify inputs for variables - exception is battery size which is done later
+# Financial assumptions
+npv_discount <- 1.1
+
 # CO2 Factors
 elec_co2 <- 0.19338
 gas_co2 <- 0.18254
@@ -127,38 +130,12 @@ annual_maint_cost_chp <- round((max_elec_demand_round / 1000) * annual_maint_cos
 heat_recovery <- 0.4
 annual_cost_chp <- annual_maint_cost_chp
 
-#########################################################################################
-# Stage 4 - Functions for battery cost which are calculated after demand
-# Function for solar battery cost is run after solar battery demand
-solar_battery_cost_function <- function(site_opt_df_post_solar) {
-  # Calculate battery size as a side function
-  solar_battery_storage_per_day <- site_opt_df_post_solar %>%
-    group_by(Date) %>%
-    summarise(sum = sum(ExcessGeneration))
-  solar_battery_usage_from_battery <- site_opt_df %>%
-    group_by(Date) %>%
-    summarise(sum = sum(UsageFromBattery))
-  energy_gap <- ifelse(solar_battery_storage_per_day$sum - solar_battery_usage_from_battery$sum > 0, solar_battery_usage_from_battery$sum - solar_battery_storage_per_day$sum, 0)
-  solar_battery_size_req <- (max(solar_battery_storage_per_day$sum - energy_gap) * 0.5)
-  solar_battery_cost_per_kwh <- 600
-  solar_battery_cost <- solar_battery_cost_per_kwh * solar_battery_size_req
-  total_setup_solar_battery <- solar_battery_cost
-  return(total_setup_solar_battery)
-}
-
-grid_battery_cost_function <- function(site_opt_df) {
-  grid_battery_storage_per_day <- site_opt_df %>%
-    group_by(Date) %>%
-    summarise(sum = sum(AdjElecUnitskwh))
-  grid_battery_size_req <- max(grid_battery_storage_per_day$sum * 0.5)
-  grid_battery_cost_per_kwh <- 600
-  grid_battery_cost <- grid_battery_cost_per_kwh * grid_battery_size_req
-  total_setup_grid_battery <- grid_battery_cost
-  return(total_setup_grid_battery)
-}
+# Initial battery assumptions
+solar_battery_cost_per_kwh <- 600
+grid_battery_cost_per_kwh <- 600
 
 ##############################################################################
-# Stage 5 - Functions for algorithm to note
+# Stage 4 - Functions for forecast demand after technology investments and costs
 led_function <- function(site_opt_df, technology_number) {
   site_opt_led <- site_opt_df
   site_opt_led$LightUseBasekwh <- round(lights * exist_power_rate_bulbs / 1000, 2)
@@ -186,54 +163,66 @@ solar_function <- function(site_opt_df, solar_panel, technology_number) {
   return(site_opt_solar)
 }
 
+# Return list of battery demand profile, battery cost, battery size
 solar_battery_function <- function(site_opt_df, solar_panel, technology_number) {
-  # Solar calculations and excess generation
+  # Stage 1 - calculate max solar for a day to generate battery size
   site_opt_solar_batt <- site_opt_df
   site_opt_solar_batt$TotalGenSolarkwh <- round(solar_panel$SolarPanel1kWgenkWh * panels * kw_per_panel, 2)
   site_opt_solar_batt$InitialElecUnitskwh <- site_opt_solar_batt$AdjElecUnitskwh
   site_opt_solar_batt$AdjElecUnitskwh <- pmax(site_opt_solar_batt$InitialElecUnitskwh - site_opt_solar_batt$TotalGenSolarkwh, 0)
   site_opt_solar_batt$ExcessGeneration <- ifelse(site_opt_solar_batt$AdjElecUnitskwh < 0, -(site_opt_solar_batt$AdjElecUnitskwh), 0)
-  
-  # Battery storage in day and use at highest price point in evening
+  solar_battery_storage_per_day <- site_opt_solar_batt %>%
+    group_by(Date) %>%
+    summarise(sum = sum(ExcessGeneration))
+  solar_battery_size_req <- (max(solar_battery_storage_per_day$sum))
+  # Stage 2 - calculate cost based on 
+  solar_battery_cost <- solar_battery_cost_per_kwh * solar_battery_size_req
+  total_setup_solar_battery <- solar_battery_cost
+  # Stage 3 - While loop to find battery storage within day and apply at highest
+  # price point in evening
   all_days <- site_opt_solar_batt$Date[!duplicated(site_opt_solar_batt$Date)]
-  yesterdays_excess_generation <- 0
+  yesterdays_excess_generation <- 0  ### Start excess generation at 0
   site_opt_solar_battery <- data.frame()
   for (day in all_days) {
-    # Add solar usage for the day and apply to highest price in evening
-    day_df <- site_opt_solar_batt[site_opt_solar_batt$Date == day, ]
-    day_df <- day_df %>% mutate(UsageRank = row_number(max(day_df$ElecPriceMWh) - day_df$ElecPriceMWh))
-    # Find the last point where
-    excess_generation <- yesterdays_excess_generation + sum(day_df$ExcessGeneration)
+    solar_batt_day_df <- site_opt_solar_batt[site_opt_solar_batt$Date == day, ]
+    solar_batt_day_df <- solar_batt_day_df %>% mutate(UsageRank = row_number(max(solar_batt_day_df$ElecPriceMWh) - solar_batt_day_df$ElecPriceMWh))
+    # Find if any excess generation from yesterday and add to today's
+    excess_generation <- yesterdays_excess_generation + sum(solar_batt_day_df$ExcessGeneration)
+    # If there was excess generation in the day - find the last available time it occurred
     if (excess_generation > 0) {
-      last_excess_generation_row <- max(c(which(day_df$ExcessGeneration > 0)))
+      last_excess_generation_row <- max(c(which(solar_batt_day_df$ExcessGeneration > 0)))
     } else {
-      last_excess_generation_row <- 0
-    }
-    remaining_values_df <- day_df[(last_excess_generation_row + 1):nrow(day_df), ] %>%
+      last_excess_generation_row <- 0}
+    # Select dataframe of all hrs in day after last period of excess generation
+    remaining_values <- solar_batt_day_df[(last_excess_generation_row + 1):nrow(solar_batt_day_df), ] %>%
       ungroup() %>%
       select(UsageRank, AdjElecUnitskwh)
-    remaining_values_df <- remaining_values_df[order(remaining_values_df$UsageRank), ]
-    remaining_values_df$UsageFromBattery <- 0
+    # Order remaining values by cost
+    remaining_values <- remaining_values[order(remaining_values$UsageRank), ]
+    remaining_values$UsageFromBattery <- 0
+    # While loop to use excess generation at highest point in day
     for (i in (1:nrow(remaining_values_df))) {
-      OutputElecComp <- remaining_values_df$AdjElecUnitskwh[i]
+      OutputElecComp <- remaining_values$AdjElecUnitskwh[i]
       remaining_values_df$UsageFromBattery[i] <- min(excess_generation, OutputElecComp)
       excess_generation <- ifelse(excess_generation - OutputElecComp > 0, excess_generation - OutputElecComp, max(0, excess_generation - OutputElecComp))
     }
-    remaining_values_df <- remaining_values_df %>% select(UsageRank, UsageFromBattery)
-    day_df <- merge(x = day_df, y = remaining_values_df, by = "UsageRank", all.x = TRUE)
-    day_df[is.na(day_df)] <- 0
-    day_df <- day_df[order(day_df$Time), ]
-    day_df$AdjElecUnitskwh <- ifelse(day_df$AdjElecUnitskwh > 0, day_df$AdjElecUnitskwh - day_df$UsageFromBattery, 0)
+    remaining_values <- remaining_values %>% select(UsageRank, UsageFromBattery)
+    solar_batt_day_df <- merge(x = solar_batt_day_df, y = remaining_values, by = "UsageRank", all.x = TRUE)
+    solar_batt_day_df[is.na(solar_batt_day_df)] <- 0
+    solar_batt_day_df <- solar_batt_day_df[order(solar_batt_day_df$Time), ]
+    solar_batt_day_df$AdjElecUnitskwh <- ifelse(solar_batt_day_df$AdjElecUnitskwh > 0, solar_batt_day_df$AdjElecUnitskwh - solar_batt_day_df$UsageFromBattery, 0)
     yesterdays_excess_generation <- excess_generation
     site_opt_solar_battery <- rbind(site_opt_solar_battery, day_df)
   }
   # Select savings and key columns
   site_opt_solar_battery[paste0(technology_number, "_savings_elec")] <- round((site_opt_solar_battery$InitialElecUnitskwh - site_opt_solar_battery$AdjElecUnitskwh) * site_opt_solar_battery$ElecPriceMWh / 1000, 2)
   site_opt_solar_battery[paste0(technology_number, "_savings_gas")] <- 0
-  return(site_opt_solar_battery)
+  # Return list of battery demand profile, battery cost, battery size
+  solar_battery_list <- list(site_opt_solar_battery, total_setup_solar_battery, solar_battery_size_req)
+  return(solar_battery_list)
 }
 
-
+# Air source heat pump function
 ashp_function <- function(site_opt_df, technology_number) {
   site_opt_df_ashp <- site_opt_df
   site_opt_df_ashp$GasHeatingUnits <- round(site_opt_df_ashp$BaseGasUnitskWh * heat_gas_use_pc, 2)
@@ -249,6 +238,7 @@ ashp_function <- function(site_opt_df, technology_number) {
   return(site_opt_df_ashp)
 }
 
+# Control heat pump function
 chp_function <- function(site_opt_df, technology_number) {
   site_opt_df_chp <- site_opt_df
   site_opt_df_chp$GasHeatUnitsComp <- round(site_opt_df_chp$AdjGasUnitskWh * heat_gas_use_pc, 2)
@@ -261,57 +251,98 @@ chp_function <- function(site_opt_df, technology_number) {
   return(site_opt_df_chp)
 }
 
-grid_battery_function <- function(site_opt_df, technology_number) {
-  site_opt_batt <- site_opt_df
-  grid_battery_storage_per_day <- site_opt_batt %>%
-    group_by(Date) %>%
-    summarise(sum = sum(AdjElecUnitskwh))
-  grid_battery_size_req <- max(grid_battery_storage_per_day$sum * 0.5)
+# Residual battery function
+# Return list of battery demand profile, battery cost, battery size and npv
+grid_battery_residual <- function(site_opt_df, technology_number, battery_size_proportion, battery_lifetime_cycle, battery_lifetime) {
+  # Stage 1 - Battery size requirements and cost
+  site_opt_grid <- site_opt_df
+  grid_battery_storage_per_day <- site_opt_grid %>%
+    group_by(Date) %>% summarise(sum = sum(AdjElecUnitskwh))
+  grid_battery_size_req <- max(grid_battery_storage_per_day$sum) * battery_size_proportion
+  grid_battery_cost <- grid_battery_cost_per_kwh * grid_battery_size_req
+  total_setup_grid_battery <- grid_battery_cost
+
+  # Stage 2 - Initiate while loop to make daily optimization solution
   grid_battery_df <- data.frame()
-  all_days <- site_opt_batt$Date[!duplicated(site_opt_batt$Date)]
+  all_days <- site_opt_grid$Date[!duplicated(site_opt_grid$Date)]
+  number_of_cycles <- 0
   for (day in all_days) {
-    # Retrieve dataframe for that day
-    battery_day_df <- site_opt_batt[site_opt_batt$Date == day, ]
-    battery_day_df$InitialElecUnitskwh <- battery_day_df$AdjElecUnitskwh
-    # Find and note when to charge
-    battery_day_df$when_charge <- 0
-    min_row <- which.min(battery_day_df[battery_day_df$Time < "12:00:00", ]$ElecPriceMWh)
-    battery_day_df$when_charge[min_row] <- 1
-    # Apply usage rank
-    battery_day_df <- battery_day_df %>% mutate(usage_rank = row_number(max(battery_day_df$ElecPriceMWh) - battery_day_df$ElecPriceMWh))
-    # Energy required is either min of rest of daily demand or max battery storage
-    charge_amount <- min(grid_battery_size_req, with(battery_day_df, min(sum(battery_day_df$InitialElecUnitskwh[(min_row + 1):nrow(battery_day_df)]))))
-    # Apply the remaining usage based on ranking order
-    battery_day_df$ChargeAmount <- 0
-    battery_day_df$ChargeAmount[min_row] <- charge_amount
-    remaining_values_df <- battery_day_df[(min_row + 1):nrow(battery_day_df), ] %>%
+    grid_battery_day <- site_opt_grid[site_opt_grid$Date == day, ]
+    # Use initial electricity unites 
+    grid_battery_day$InitialElecUnitskwh <- grid_battery_day$AdjElecUnitskwh
+    grid_battery_day$when_charge <- 0
+    min_row <- which.min(grid_battery_day[grid_battery_day$Time < "12:00:00", ]$ElecPriceMWh)
+    grid_battery_day$when_charge[min_row] <- 1
+    grid_battery_day <- grid_battery_day %>% mutate(usage_rank = row_number(max(grid_battery_day$ElecPriceMWh) - grid_battery_day$ElecPriceMWh))
+    charge_amount <- min(grid_battery_size_req, with(grid_battery_day, min(sum(grid_battery_day$InitialElecUnitskwh[(min_row + 1):nrow(grid_battery_day)]))))
+    grid_battery_day$ChargeAmount <- 0
+    grid_battery_day$ChargeAmount[min_row] <- charge_amount
+    remaining_values <- grid_battery_day[(min_row + 1):nrow(grid_battery_day), ] %>%
       ungroup() %>%
       select(usage_rank, InitialElecUnitskwh)
-    # Apply usage based on ranked order
-    remaining_values_df <- remaining_values_df[order(remaining_values_df$usage_rank), ]
-    # Initiate for loop to apply remaining charge
-    remaining_values_df$usage_from_grid_battery <- 0
+    remaining_values <- remaining_values[order(remaining_values$usage_rank), ]
+    remaining_values$usage_from_grid_battery <- 0
     remaining_charge_amount <- charge_amount
-    for (i in (1:nrow(remaining_values_df))) {
-      InitialElecUnitskwh <- remaining_values_df$InitialElecUnitskwh[i]
-      remaining_values_df$usage_from_grid_battery[i] <- min(remaining_charge_amount, InitialElecUnitskwh)
+    for (i in (1:nrow(remaining_values))) {
+      InitialElecUnitskwh <- remaining_values$InitialElecUnitskwh[i]
+      remaining_values$usage_from_grid_battery[i] <- min(remaining_charge_amount, InitialElecUnitskwh)
       remaining_charge_amount <- ifelse(remaining_charge_amount - InitialElecUnitskwh > 0, remaining_charge_amount - InitialElecUnitskwh, max(0, remaining_charge_amount - InitialElecUnitskwh))
     }
-    remaining_values_df <- remaining_values_df %>%
+    remaining_values <- remaining_values %>%
       ungroup() %>%
       select(usage_rank, usage_from_grid_battery)
-    # fill nas with 0
-    remaining_values_df[is.na(remaining_values_df)] <- 0
-    battery_day_df <- merge(x = battery_day_df, y = remaining_values_df, by = "usage_rank", all.x = TRUE)
-    battery_day_df[is.na(battery_day_df)] <- 0
-    battery_day_df <- battery_day_df[order(battery_day_df$Time), ]
-    battery_day_df$AdjElecUnitskwh <- round(battery_day_df$InitialElecUnitskwh + battery_day_df$ChargeAmount - battery_day_df$usage_from_grid_battery, 2)
-    battery_day_df[paste0(technology_number, "_savings_elec")] <- round(battery_day_df$InitialElecUnitskwh - battery_day_df$AdjElecUnitskwh, 2) * battery_day_df$ElecPriceMWh / 1000
-    battery_day_df[paste0(technology_number, "_savings_gas")] <- 0
-    grid_battery_df <- rbind(grid_battery_df, battery_day_df)
+    remaining_values[is.na(remaining_values)] <- 0
+    grid_battery_day <- merge(x = grid_battery_day, y = remaining_values, by = "usage_rank", all.x = TRUE)
+    grid_battery_day[is.na(grid_battery_day)] <- 0
+    grid_battery_day <- grid_battery_day[order(grid_battery_day$Time), ]
+    grid_battery_day$AdjElecUnitskwh <- round(grid_battery_day$InitialElecUnitskwh + grid_battery_day$ChargeAmount - grid_battery_day$usage_from_grid_battery, 2)
+    grid_battery_day[paste0(technology_number, "_savings_elec")] <- round(grid_battery_day$InitialElecUnitskwh - grid_battery_day$AdjElecUnitskwh, 2) * grid_battery_day$ElecPriceMWh / 1000
+    grid_battery_day[paste0(technology_number, "_savings_gas")] <- 0
+    grid_battery_df <- rbind(grid_battery_df, grid_battery_day)
+    number_of_cycles <- number_of_cycles + 1
+    print(number_of_cycles)
+    if(number_of_cycles > battery_lifetime_cycle){
+      break
+    }
   }
+  
+  # Calculate NPV value over lifetime
+  grid_battery_df$Savings <- round(grid_battery_df$InitialElecUnitskwh - grid_battery_df$AdjElecUnitskwh, 2) * grid_battery_df$ElecPriceMWh / 1000
+  npv <- select(grid_battery_df, Date, Time, Savings)
+  npv$Year <- 0
+  min_date <- min(npv$Date, na.rm = TRUE)
+  npv$Year[npv$Date >= min_date & npv$Date < (min_date + years(1))] <- 1
+  npv$Year[npv$Date >= (min_date + years(1)) & npv$Date < (min_date + years(2))] <- 2
+  npv$Year[npv$Date >= (min_date + years(2)) & npv$Date < (min_date + years(3))] <- 3
+  npv$Year[npv$Date >= (min_date + years(3)) & npv$Date < (min_date + years(4))] <- 4
+  npv$Year[npv$Date >= (min_date + years(4)) & npv$Date < (min_date + years(5))] <- 5
+  npv$Year[npv$Date >= (min_date + years(5)) & npv$Date < (min_date + years(6))] <- 6
+  npv$Year[npv$Date >= (min_date + years(6)) & npv$Date < (min_date + years(7))] <- 7
+  npv$Year[npv$Date >= (min_date + years(7)) & npv$Date < (min_date + years(8))] <- 8
+  npv$Year[npv$Date >= (min_date + years(8)) & npv$Date < (min_date + years(9))] <- 9
+  npv$Year[npv$Date >= (min_date + years(9)) & npv$Date < (min_date + years(10))] <- 10
+  
+  # Calculate NPV for ten years
+  year1_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 1], na.rm = TRUE) / (npv_discount)
+  year2_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 2], na.rm = TRUE) / (npv_discount^2)
+  year3_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 3], na.rm = TRUE) / (npv_discount^3)
+  year4_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 4], na.rm = TRUE) / (npv_discount^4)
+  year5_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 5], na.rm = TRUE) / (npv_discount^5)
+  year6_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 6], na.rm = TRUE) / (npv_discount^6)
+  year7_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 7], na.rm = TRUE) / (npv_discount^7)
+  year8_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 8], na.rm = TRUE) / (npv_discount^8)
+  year9_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 9], na.rm = TRUE) / (npv_discount^9)
+  year10_battery_disc_cash_flow_tot <- sum(npv$Savings[npv$Year == 10], na.rm = TRUE) / (npv_discount^10)
+  
+  total_npv <- sum(year1_battery_disc_cash_flow_tot, year2_battery_disc_cash_flow_tot, year3_battery_disc_cash_flow_tot, year4_battery_disc_cash_flow_tot,
+                   year5_battery_disc_cash_flow_tot, year6_battery_disc_cash_flow_tot, year7_battery_disc_cash_flow_tot, year8_battery_disc_cash_flow_tot,
+                   year9_battery_disc_cash_flow_tot, year10_battery_disc_cash_flow_tot)
+  
+  # Select only relevant columns for orginal grid battery dataframe
   grid_battery_df <- select(grid_battery_df, -InitialElecUnitskwh, when_charge, ChargeAmount, usage_from_grid_battery)
-  return(grid_battery_df)
+  # Return list of battery demand profile, battery cost, battery size and npv
+  grid_battery_list <- list(grid_battery_df, total_setup_grid_battery, )
+  return(grid_battery_df, total_setup_grid_battery, grid_battery_size_req, total_npv)
 }
 
 ##############################################################################
@@ -494,9 +525,7 @@ year8_elec_change <- year8_elec_new - year8_elec_base
 year9_elec_change <- year9_elec_new - year9_elec_base
 year10_elec_change <- year10_elec_new - year10_elec_base
 
-######################################################################
 ############################### Gas ############################
-
 # base year 1 - 10
 year0_gas_base <- 0
 year1_gas_base <- sum(site_opt5$BaseGasUnitskWh[site_opt5$Year == 1], na.rm = TRUE)
@@ -536,9 +565,7 @@ year8_gas_change <- year8_gas_new - year8_gas_base
 year9_gas_change <- year9_gas_new - year9_gas_base
 year10_gas_change <- year10_gas_new - year10_gas_base
 
-#############################################################################
 ############################### CO2 ############################
-
 # base year 1 - 10
 year0_co2_base <- 0
 year1_co2_base <- elec_co2 * year1_elec_base + gas_co2 * year1_gas_base
@@ -608,7 +635,6 @@ year8_co2_change <- ifelse(is.na(year8_co2_new - year8_co2_base), 0, year8_co2_n
 year9_co2_change <- ifelse(is.na(year9_co2_new - year9_co2_base), 0, year9_co2_new - year9_co2_base)
 year10_co2_change <- ifelse(is.na(year10_co2_new - year10_co2_base), 0, year10_co2_new - year10_co2_base)
 
-##################################################################################
 ######################### Electricity Paid #######################################
 # baseline all years 1 - 10
 year0_elec_paid_base <- 0
@@ -688,7 +714,6 @@ year8_elec_paid_new <- year8_elec_paid_base + year8_tech_1_elec_paid + year8_tec
 year9_elec_paid_new <- year9_elec_paid_base + year9_tech_1_elec_paid + year9_tech_2_elec_paid + year9_tech_3_elec_paid + year9_tech_4_elec_paid
 year10_elec_paid_new <- year10_elec_paid_base + year10_tech_1_elec_paid + year10_tech_2_elec_paid + year10_tech_3_elec_paid + year10_tech_4_elec_paid
 
-##################################################################################
 ############################ Gas Paid ############################################
 # baseline
 year0_gas_paid_base <- 0
@@ -824,16 +849,16 @@ year10_cash_flow_tot <- year10_cash_flow_benefits + year10_cash_flow_costs + yea
 
 # total - discounted at npv
 year0_disc_cash_flow_tot <- (year0_cash_flow_benefits + year0_cash_flow_costs + year0_cash_flow_setup)
-year1_disc_cash_flow_tot <- (year1_cash_flow_benefits + year1_cash_flow_costs + year1_cash_flow_setup) / (1.1)
-year2_disc_cash_flow_tot <- (year2_cash_flow_benefits + year2_cash_flow_costs + year2_cash_flow_setup) / (1.1^2)
-year3_disc_cash_flow_tot <- (year3_cash_flow_benefits + year3_cash_flow_costs + year3_cash_flow_setup) / (1.1^3)
-year4_disc_cash_flow_tot <- (year4_cash_flow_benefits + year4_cash_flow_costs + year4_cash_flow_setup) / (1.1^4)
-year5_disc_cash_flow_tot <- (year5_cash_flow_benefits + year5_cash_flow_costs + year5_cash_flow_setup) / (1.1^5)
-year6_disc_cash_flow_tot <- (year6_cash_flow_benefits + year6_cash_flow_costs + year6_cash_flow_setup) / (1.1^6)
-year7_disc_cash_flow_tot <- (year7_cash_flow_benefits + year7_cash_flow_costs + year7_cash_flow_setup) / (1.1^7)
-year8_disc_cash_flow_tot <- (year8_cash_flow_benefits + year8_cash_flow_costs + year8_cash_flow_setup) / (1.1^8)
-year9_disc_cash_flow_tot <- (year9_cash_flow_benefits + year9_cash_flow_costs + year9_cash_flow_setup) / (1.1^9)
-year10_disc_cash_flow_tot <- (year10_cash_flow_benefits + year10_cash_flow_costs + year10_cash_flow_setup) / (1.1^10)
+year1_disc_cash_flow_tot <- (year1_cash_flow_benefits + year1_cash_flow_costs + year1_cash_flow_setup) / (npv_discount)
+year2_disc_cash_flow_tot <- (year2_cash_flow_benefits + year2_cash_flow_costs + year2_cash_flow_setup) / (npv_discount^2)
+year3_disc_cash_flow_tot <- (year3_cash_flow_benefits + year3_cash_flow_costs + year3_cash_flow_setup) / (npv_discount^3)
+year4_disc_cash_flow_tot <- (year4_cash_flow_benefits + year4_cash_flow_costs + year4_cash_flow_setup) / (npv_discount^4)
+year5_disc_cash_flow_tot <- (year5_cash_flow_benefits + year5_cash_flow_costs + year5_cash_flow_setup) / (npv_discount^5)
+year6_disc_cash_flow_tot <- (year6_cash_flow_benefits + year6_cash_flow_costs + year6_cash_flow_setup) / (npv_discount^6)
+year7_disc_cash_flow_tot <- (year7_cash_flow_benefits + year7_cash_flow_costs + year7_cash_flow_setup) / (npv_discount^7)
+year8_disc_cash_flow_tot <- (year8_cash_flow_benefits + year8_cash_flow_costs + year8_cash_flow_setup) / (npv_discount^8)
+year9_disc_cash_flow_tot <- (year9_cash_flow_benefits + year9_cash_flow_costs + year9_cash_flow_setup) / (npv_discount^9)
+year10_disc_cash_flow_tot <- (year10_cash_flow_benefits + year10_cash_flow_costs + year10_cash_flow_setup) / (npv_discount^10)
 
 # create cols for year df
 # create cols for year df
